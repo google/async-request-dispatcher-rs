@@ -182,6 +182,12 @@ Adjust these values to tune throughput and backpressure behavior.
 
 ---
 
+### Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for details.
+
+---
+
 ### License
 
 Apache 2.0. See [`LICENSE`](LICENSE) for details.
