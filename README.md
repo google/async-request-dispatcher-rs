@@ -7,6 +7,8 @@ This Rust project implements a high-performance **in-process asynchronous reques
 
 ### Included example: GCP GenAI API Request Dispatcher
 
+[Documentation](docs/gcp_genai_api_example.md)
+
 ```shell
 cargo run --example gcp-genai-api
 ```
