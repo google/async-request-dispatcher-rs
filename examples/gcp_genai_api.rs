@@ -12,33 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::google::cloud::aiplatform::v1::prediction_service_client::PredictionServiceClient;
-use crate::google::cloud::aiplatform::v1::{GenerateContentRequest, GenerateContentResponse};
 use crate::worker_pool::{WorkerMetrics, WorkerPool};
-use anyhow::anyhow;
+use anyhow::{Context, bail};
 use async_request_dispatcher::worker_pool;
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use env_logger::Env;
-use google_cloud_auth::credentials::{
-    Builder, CacheableResource, Credentials, EntityTag, impersonated,
-};
+use google_cloud_aiplatform_v1::client::PredictionService;
+use google_cloud_aiplatform_v1::model::{GenerateContentRequest, GenerateContentResponse};
+use google_cloud_auth::credentials::{Builder, Credentials, impersonated};
+use google_cloud_gax::exponential_backoff::ExponentialBackoff;
+use google_cloud_gax::retry_policy::{AlwaysRetry, RetryPolicyExt};
+use http::HeaderMap;
 use http::StatusCode;
-use http::{Extensions, HeaderMap};
 use log::{debug, info};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::env::var;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
-use tonic::Request;
-use tonic::metadata::MetadataValue;
-use tonic::metadata::errors::InvalidMetadataValue;
-use tonic::transport::{Channel, ClientTlsConfig};
 
-tonic::include_proto!("gcp");
+static REGION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,30 +46,49 @@ async fn main() -> anyhow::Result<()> {
     let num_cpus = std::thread::available_parallelism()?;
     info!("number of CPUs available: {}", num_cpus);
 
-    const AI_PLATFORM_ENDPOINT: &'static str = "https://aiplatform.googleapis.com";
-
     let credentials = ApiCredentials::build()?;
-    let tls_config = ClientTlsConfig::new().with_native_roots();
-    let channel = Channel::from_static(AI_PLATFORM_ENDPOINT)
-        .tls_config(tls_config)?
-        .connect()
-        .await?;
-
-    let workers =
-        worker_pool::spawn_workers::<GenerateContentRequest, GenerateContentResponse, _, _, _>(
-            num_cpus.into(),
-            move |r| {
-                let creds = credentials.clone();
-                let channel = channel.clone();
-                async move { process_request(r, channel, creds).await }
-            },
-        );
+    let creds = credentials.clone();
+    let workers = worker_pool::spawn_workers::<ApiRequest, GenerateContentResponse, _, _, _>(
+        num_cpus.into(),
+        move |r| {
+            let creds = creds.clone();
+            async move { process_request(r, creds).await }
+        },
+    );
 
     let wp = WorkerPool::new(workers, Duration::from_secs(300));
+    let project_id = var("GOOGLE_CLOUD_PROJECT")?;
+    let model_id = var("MODEL_ID")?;
+    let data = var("MODEL_CONFIG").with_context(|| "MODEL_CONFIG env variable is required!")?;
+    let model_config: Vec<ModelConfig> = serde_json::from_str(&data)?;
+    let model_map: HashMap<String, Vec<String>> = model_config
+        .into_iter()
+        .map(|c| (c.model_id, c.supported_regions))
+        .collect();
+    let regions = match model_map.get(&model_id) {
+        Some(r) => {
+            info!(
+                "using the configured {} regions for model_id: {}",
+                r.iter().len(),
+                model_id
+            );
+            r.to_owned()
+        }
+        None => bail!(
+            "supported regions data is required for model_id: {}",
+            model_id
+        ),
+    };
+
     let app = Router::new()
         .route("/generate", post(generate_content))
         .route("/metrics", get(worker_metrics))
-        .with_state(Api { wp });
+        .with_state(Api {
+            wp,
+            project_id: Arc::new(project_id),
+            model_id: Arc::new(model_id),
+            supported_regions: Arc::new(regions),
+        });
 
     let addr = "0.0.0.0:8080";
     info!("request dispatcher listening: {}", addr);
@@ -84,19 +100,57 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Clone)]
 pub(crate) struct Api {
-    pub(crate) wp: Arc<WorkerPool<GenerateContentRequest, GenerateContentResponse>>,
+    pub(crate) wp: Arc<WorkerPool<ApiRequest, GenerateContentResponse>>,
+    pub(crate) project_id: Arc<String>,
+    pub(crate) model_id: Arc<String>,
+    pub(crate) supported_regions: Arc<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelConfig {
+    model_id: String,
+    supported_regions: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct ApiRequest {
+    pub region: String,
+    pub req: GenerateContentRequest,
 }
 
 type ApiResult<T> = Result<T, (StatusCode, String)>;
 
 pub(crate) async fn generate_content(
-    State(Api { wp }): State<Api>,
+    State(Api {
+        wp,
+        project_id,
+        model_id,
+        supported_regions,
+    }): State<Api>,
     headers: HeaderMap,
-    req: Json<GenerateContentRequest>,
+    mut req: Json<GenerateContentRequest>,
 ) -> ApiResult<Json<GenerateContentResponse>> {
     let session = headers.get("x-session-id").and_then(|v| v.to_str().ok());
 
-    match wp.submit(session, req.0).await {
+    let index = REGION_COUNTER.fetch_add(1, Ordering::SeqCst) % supported_regions.len();
+    let region = &supported_regions[index];
+
+    req.0.model = format!(
+        "projects/{}/locations/{}/publishers/google/models/{}",
+        project_id, region, model_id
+    );
+    info!("processing the request using model: {}", &req.0.model);
+
+    match wp
+        .submit(
+            session,
+            ApiRequest {
+                region: region.clone(),
+                req: req.0,
+            },
+        )
+        .await
+    {
         Ok(res) => Ok(Json(res)),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -105,33 +159,34 @@ pub(crate) async fn generate_content(
     }
 }
 
-pub(crate) async fn worker_metrics(State(Api { wp }): State<Api>) -> Json<Vec<WorkerMetrics>> {
+pub(crate) async fn worker_metrics(State(Api { wp, .. }): State<Api>) -> Json<Vec<WorkerMetrics>> {
     Json(wp.worker_metrics())
 }
 
 pub(crate) async fn process_request(
-    req: GenerateContentRequest,
-    channel: Channel,
-    mut creds: ApiCredentials,
+    r: ApiRequest,
+    creds: ApiCredentials,
 ) -> anyhow::Result<GenerateContentResponse> {
-    info!("processing request: {:?}", &req);
-    let authorization = creds.get_auth_header().await?;
-    let auth = MetadataValue::try_from(authorization).map_err(ApiError::from)?;
-    let mut client =
-        PredictionServiceClient::with_interceptor(channel, move |mut req: Request<()>| {
-            req.metadata_mut().insert("authorization", auth.clone());
-            Ok(req)
-        });
-    let res = client.generate_content(req).await?.into_inner();
+    info!("processing request: {}", serde_json::to_string(&r.req)?);
+    let credentials = creds.inner;
+    let endpoint = format!("https://{}-aiplatform.googleapis.com", r.region);
+    let exponential_backoff = ExponentialBackoff::default();
+    let retry_policy = AlwaysRetry.with_attempt_limit(3);
+    let svc = PredictionService::builder()
+        .with_credentials(credentials)
+        .with_endpoint(endpoint)
+        .with_backoff_policy(exponential_backoff)
+        .with_retry_policy(retry_policy)
+        .build()
+        .await?;
+    let res = svc.generate_content().with_request(r.req).send().await?;
     debug!("api response: {:?}", &res);
     Ok(res)
 }
 
 #[derive(Clone, Debug)]
 pub struct ApiCredentials {
-    inner: Arc<Mutex<Credentials>>,
-    tag: Option<EntityTag>,
-    cached: HeaderMap,
+    inner: Credentials,
 }
 
 impl ApiCredentials {
@@ -144,48 +199,6 @@ impl ApiCredentials {
         } else {
             source_credentials
         };
-        Ok(Self {
-            inner: Arc::new(Mutex::new(credentials)),
-            tag: None,
-            cached: HeaderMap::new(),
-        })
-    }
-
-    pub async fn get_headers(&mut self) -> anyhow::Result<HeaderMap> {
-        let extensions = self.tag.iter().fold(Extensions::new(), |mut v, e| {
-            v.insert(e.clone());
-            v
-        });
-
-        let creds = self.inner.lock().await;
-        match creds.headers(extensions).await? {
-            CacheableResource::NotModified => Ok(self.cached.clone()),
-            CacheableResource::New { entity_tag, data } => {
-                self.cached = data;
-                self.tag = Some(entity_tag);
-                Ok(self.cached.clone())
-            }
-        }
-    }
-
-    pub async fn get_auth_header(&mut self) -> anyhow::Result<String> {
-        let headers = self.get_headers().await?;
-        Ok(headers
-            .get("authorization")
-            .ok_or_else(|| anyhow!("authorization error"))?
-            .to_str()?
-            .to_string())
-    }
-}
-
-#[derive(Error, Debug)]
-pub enum ApiError {
-    #[error("error occurred: {0}")]
-    MetadataValueError(#[from] InvalidMetadataValue),
-}
-
-impl From<ApiError> for tonic::Status {
-    fn from(e: ApiError) -> Self {
-        Self::internal(format!("error occurred: {}", e))
+        Ok(Self { inner: credentials })
     }
 }
