@@ -15,25 +15,29 @@
 use crate::worker_pool::{WorkerMetrics, WorkerPool};
 use anyhow::{Context, bail};
 use async_request_dispatcher::worker_pool;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use dashmap::DashMap;
 use env_logger::Env;
+use firestore::{FirestoreDb, FirestoreDbOptions};
 use google_cloud_aiplatform_v1::client::PredictionService;
 use google_cloud_aiplatform_v1::model::{GenerateContentRequest, GenerateContentResponse};
 use google_cloud_auth::credentials::{Builder, Credentials, impersonated};
 use google_cloud_gax::exponential_backoff::ExponentialBackoff;
+use google_cloud_gax::options::RequestOptionsBuilder;
 use google_cloud_gax::retry_policy::{AlwaysRetry, RetryPolicyExt};
 use http::HeaderMap;
 use http::StatusCode;
-use log::{debug, info};
-use serde::Deserialize;
+use log::{debug, error, info};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env::var;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
+use uuid::Uuid;
 
 static REGION_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -57,6 +61,41 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let wp = WorkerPool::new(workers, Duration::from_secs(300));
+    let (firestore_db, firestore_collection) = match var("FIRESTORE_COLLECTION") {
+        Ok(col) => (
+            Some(
+                FirestoreDb::with_options(
+                    FirestoreDbOptions::new(var("GOOGLE_CLOUD_PROJECT")?).with_database_id(
+                        var("FIRESTORE_DATABASE")
+                            .with_context(|| "FIRESTORE_DATABASE env variable is required.")?,
+                    ),
+                )
+                .await?,
+            ),
+            col,
+        ),
+        Err(_) => (None, env!("CARGO_BIN_NAME").to_string()),
+    };
+
+    let job_registry = Arc::new(DashMap::new());
+    let registry_clone = job_registry.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let ttl = Duration::from_secs(3600);
+            let initial_len = registry_clone.len();
+            registry_clone.retain(|_, entry: &mut JobEntry<GenerateContentResponse>| {
+                now.duration_since(entry.created_at) < ttl
+            });
+            let removed = initial_len - registry_clone.len();
+            if removed > 0 {
+                info!("cleaning up {} expired jobs", removed);
+            }
+        }
+    });
+
     let project_id = var("GOOGLE_CLOUD_PROJECT")?;
     let model_id = var("MODEL_ID")?;
     let data = var("MODEL_CONFIG").with_context(|| "MODEL_CONFIG env variable is required!")?;
@@ -82,12 +121,16 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/generate", post(generate_content))
+        .route("/jobs/{id}", get(get_job_status))
         .route("/metrics", get(worker_metrics))
         .with_state(Api {
             wp,
             project_id: Arc::new(project_id),
             model_id: Arc::new(model_id),
             supported_regions: Arc::new(regions),
+            job_registry,
+            firestore_db,
+            firestore_collection: Arc::new(firestore_collection),
         });
 
     let addr = "0.0.0.0:8080";
@@ -104,6 +147,9 @@ pub(crate) struct Api {
     pub(crate) project_id: Arc<String>,
     pub(crate) model_id: Arc<String>,
     pub(crate) supported_regions: Arc<Vec<String>>,
+    pub(crate) job_registry: Arc<DashMap<String, JobEntry<GenerateContentResponse>>>,
+    pub(crate) firestore_db: Option<FirestoreDb>,
+    pub(crate) firestore_collection: Arc<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,7 +164,54 @@ pub struct ApiRequest {
     pub req: GenerateContentRequest,
 }
 
-type ApiResult<T> = Result<T, (StatusCode, String)>;
+use axum::response::IntoResponse;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ApiError {
+    #[error("job: {0} not found")]
+    NotFound(String),
+
+    #[error("firestore error: {0}")]
+    FirestoreError(String),
+
+    #[error("serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+
+    #[error("internal error: {0}")]
+    Internal(#[from] anyhow::Error),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let status = match &self {
+            ApiError::NotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, format!("error occurred: {}", self)).into_response()
+    }
+}
+
+pub(crate) type ApiResult<T> = std::result::Result<T, ApiError>;
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(tag = "status", content = "result")]
+pub enum JobStatus<T> {
+    Pending,
+    Completed(T),
+    Failed(String),
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct JobEntry<T> {
+    pub status: JobStatus<T>,
+    #[serde(skip, default = "Instant::now")]
+    pub created_at: Instant,
+}
+
+#[derive(Serialize)]
+pub struct ApiResponse {
+    pub job_id: String,
+}
 
 pub(crate) async fn generate_content(
     State(Api {
@@ -126,36 +219,160 @@ pub(crate) async fn generate_content(
         project_id,
         model_id,
         supported_regions,
+        job_registry,
+        firestore_db,
+        firestore_collection,
     }): State<Api>,
     headers: HeaderMap,
     mut req: Json<GenerateContentRequest>,
-) -> ApiResult<Json<GenerateContentResponse>> {
-    let session = headers.get("x-session-id").and_then(|v| v.to_str().ok());
+) -> ApiResult<Json<ApiResponse>> {
+    let session = headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
-    let index = REGION_COUNTER.fetch_add(1, Ordering::SeqCst) % supported_regions.len();
-    let region = &supported_regions[index];
+    let region = if supported_regions.len() == 1 && supported_regions[0] == "global" {
+        "global"
+    } else {
+        let index = REGION_COUNTER.fetch_add(1, Ordering::SeqCst) % supported_regions.len();
+        &supported_regions[index]
+    };
 
     req.0.model = format!(
         "projects/{}/locations/{}/publishers/google/models/{}",
         project_id, region, model_id
     );
-    info!("processing the request using model: {}", &req.0.model);
+    debug!("processing the request using model: {}", &req.0.model);
 
-    match wp
-        .submit(
-            session,
-            ApiRequest {
-                region: region.clone(),
-                req: req.0,
-            },
+    let job_id = Uuid::new_v4().to_string();
+    let entry = JobEntry {
+        status: JobStatus::Pending,
+        created_at: Instant::now(),
+    };
+    job_registry.insert(job_id.clone(), entry.clone());
+
+    if let Some(db) = firestore_db.clone() {
+        tokio::time::timeout(
+            Duration::from_secs(600),
+            db.fluent()
+                .update()
+                .in_col(&firestore_collection)
+                .document_id(&job_id)
+                .object(&entry)
+                .execute::<()>(),
         )
         .await
-    {
-        Ok(res) => Ok(Json(res)),
-        Err(e) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("error submitting job: {e}"),
-        )),
+        .map_err(|_| ApiError::FirestoreError(format!("job: {} timed out", job_id)))?
+        .map_err(|e| ApiError::FirestoreError(format!("job: {} error occurred: {}", job_id, e)))?;
+    }
+
+    let wp = wp.clone();
+    let registry = job_registry.clone();
+    let id_clone = job_id.clone();
+    let region = region.to_string();
+    let generate_content_req = req.0;
+    let session_clone = session.clone();
+    let db_clone = firestore_db.clone();
+    let collection_clone = firestore_collection.clone();
+
+    tokio::spawn(async move {
+        let result = wp
+            .submit(
+                session_clone.as_deref(),
+                ApiRequest {
+                    region,
+                    req: generate_content_req.clone(),
+                },
+            )
+            .await;
+
+        let final_entry = match result {
+            Ok(res) => JobEntry {
+                status: JobStatus::Completed(res),
+                created_at: Instant::now(),
+            },
+            Err(e) => {
+                error!(
+                    "error occurred processing request: {:?}",
+                    serde_json::to_string(&generate_content_req)
+                );
+                JobEntry {
+                    status: JobStatus::Failed(e.to_string()),
+                    created_at: Instant::now(),
+                }
+            }
+        };
+
+        registry.insert(id_clone.clone(), final_entry.clone());
+
+        if let Some(db) = db_clone {
+            tokio::time::timeout(
+                Duration::from_secs(600),
+                db.fluent()
+                    .update()
+                    .in_col(&collection_clone)
+                    .document_id(&id_clone)
+                    .object(&final_entry)
+                    .execute::<()>(),
+            )
+            .await
+            .map_err(|_| {
+                error!(
+                    "{}",
+                    ApiError::FirestoreError(format!("job: {} timed out", id_clone))
+                )
+            })
+            .map(|res| {
+                if let Err(e) = res {
+                    error!(
+                        "{}",
+                        ApiError::FirestoreError(format!(
+                            "job: {} error occurred: {}",
+                            id_clone, e
+                        ))
+                    );
+                }
+            })
+            .ok();
+        }
+    });
+
+    Ok(Json(ApiResponse { job_id }))
+}
+
+pub(crate) async fn get_job_status(
+    State(Api {
+        job_registry,
+        firestore_db,
+        firestore_collection,
+        ..
+    }): State<Api>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<JobStatus<GenerateContentResponse>>> {
+    match job_registry.get(&id) {
+        Some(entry) => Ok(Json(entry.value().status.clone())),
+        None => {
+            if let Some(db) = firestore_db {
+                let val: Option<JobEntry<GenerateContentResponse>> = tokio::time::timeout(
+                    Duration::from_secs(600),
+                    db.fluent()
+                        .select()
+                        .by_id_in(&firestore_collection)
+                        .obj()
+                        .one(&id),
+                )
+                .await
+                .map_err(|_| ApiError::FirestoreError(format!("job: {} timed out", id)))?
+                .map_err(|e| {
+                    ApiError::FirestoreError(format!("job: {} error occurred: {}", id, e))
+                })?;
+
+                if let Some(entry) = val {
+                    return Ok(Json(entry.status));
+                }
+            }
+            Err(ApiError::NotFound(id))
+        }
     }
 }
 
@@ -167,9 +384,13 @@ pub(crate) async fn process_request(
     r: ApiRequest,
     creds: ApiCredentials,
 ) -> anyhow::Result<GenerateContentResponse> {
-    info!("processing request: {}", serde_json::to_string(&r.req)?);
+    debug!("processing request: {}", serde_json::to_string(&r.req)?);
     let credentials = creds.inner;
-    let endpoint = format!("https://{}-aiplatform.googleapis.com", r.region);
+    let endpoint = if r.region == "global" {
+        "https://aiplatform.googleapis.com".to_string()
+    } else {
+        format!("https://{}-aiplatform.googleapis.com", r.region)
+    };
     let exponential_backoff = ExponentialBackoff::default();
     let retry_policy = AlwaysRetry.with_attempt_limit(3);
     let svc = PredictionService::builder()
@@ -179,7 +400,12 @@ pub(crate) async fn process_request(
         .with_retry_policy(retry_policy)
         .build()
         .await?;
-    let res = svc.generate_content().with_request(r.req).send().await?;
+    let res = svc
+        .generate_content()
+        .with_request(r.req)
+        .with_attempt_timeout(Duration::from_secs(300))
+        .send()
+        .await?;
     debug!("api response: {:?}", &res);
     Ok(res)
 }
