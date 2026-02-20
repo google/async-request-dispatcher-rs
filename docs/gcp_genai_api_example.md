@@ -86,3 +86,7 @@ The included `Dockerfile` is configured to build and package this example.
     ```
 
     *   `^#^`: This prefix tells `gcloud` to use `#` as a delimiter instead of the default comma, which is necessary because the JSON string contains commas.
+
+## Disclaimer
+
+This is an example implementation and is not an officially supported Google product. It is provided "as is" without any warranties or guarantees.
