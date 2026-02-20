@@ -51,12 +51,61 @@ async fn main() -> anyhow::Result<()> {
     info!("number of CPUs available: {}", num_cpus);
 
     let credentials = ApiCredentials::build()?;
-    let creds = credentials.clone();
+
+    let project_id = var("GOOGLE_CLOUD_PROJECT")?;
+    let model_id = var("MODEL_ID")?;
+    let data = var("MODEL_CONFIG").with_context(|| "MODEL_CONFIG env variable is required!")?;
+    let model_config: Vec<ModelConfig> = serde_json::from_str(&data)?;
+    let model_map: HashMap<String, Vec<String>> = model_config
+        .into_iter()
+        .map(|c| (c.model_id, c.supported_regions))
+        .collect();
+    let regions = match model_map.get(&model_id) {
+        Some(r) => {
+            info!(
+                "using the configured {} regions for model_id: {}",
+                r.iter().len(),
+                model_id
+            );
+            r.to_owned()
+        }
+        None => bail!(
+            "supported regions data is required for model_id: {}",
+            model_id
+        ),
+    };
+
+    let mut client_map = HashMap::new();
+    for region in &regions {
+        let endpoint = if region == "global" {
+            "https://aiplatform.googleapis.com".to_string()
+        } else {
+            format!("https://{}-aiplatform.googleapis.com", region)
+        };
+        let exponential_backoff = ExponentialBackoff::default();
+        let retry_policy = AlwaysRetry.with_attempt_limit(3);
+        let svc = PredictionService::builder()
+            .with_credentials(credentials.inner.clone())
+            .with_endpoint(endpoint)
+            .with_backoff_policy(exponential_backoff)
+            .with_retry_policy(retry_policy)
+            .build()
+            .await?;
+        client_map.insert(region.clone(), svc);
+    }
+    let clients = Arc::new(client_map);
+
     let workers = worker_pool::spawn_workers::<ApiRequest, GenerateContentResponse, _, _, _>(
         num_cpus.into(),
         move |r| {
-            let creds = creds.clone();
-            async move { process_request(r, creds).await }
+            let clients = clients.clone();
+            async move {
+                let svc = clients
+                    .get(&r.region)
+                    .with_context(|| format!("no client found for region: {}", r.region))?
+                    .clone();
+                process_request(r, svc).await
+            }
         },
     );
 
@@ -95,29 +144,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-
-    let project_id = var("GOOGLE_CLOUD_PROJECT")?;
-    let model_id = var("MODEL_ID")?;
-    let data = var("MODEL_CONFIG").with_context(|| "MODEL_CONFIG env variable is required!")?;
-    let model_config: Vec<ModelConfig> = serde_json::from_str(&data)?;
-    let model_map: HashMap<String, Vec<String>> = model_config
-        .into_iter()
-        .map(|c| (c.model_id, c.supported_regions))
-        .collect();
-    let regions = match model_map.get(&model_id) {
-        Some(r) => {
-            info!(
-                "using the configured {} regions for model_id: {}",
-                r.iter().len(),
-                model_id
-            );
-            r.to_owned()
-        }
-        None => bail!(
-            "supported regions data is required for model_id: {}",
-            model_id
-        ),
-    };
 
     let app = Router::new()
         .route("/generate", post(generate_content))
@@ -382,24 +408,9 @@ pub(crate) async fn worker_metrics(State(Api { wp, .. }): State<Api>) -> Json<Ve
 
 pub(crate) async fn process_request(
     r: ApiRequest,
-    creds: ApiCredentials,
+    svc: PredictionService,
 ) -> anyhow::Result<GenerateContentResponse> {
     debug!("processing request: {}", serde_json::to_string(&r.req)?);
-    let credentials = creds.inner;
-    let endpoint = if r.region == "global" {
-        "https://aiplatform.googleapis.com".to_string()
-    } else {
-        format!("https://{}-aiplatform.googleapis.com", r.region)
-    };
-    let exponential_backoff = ExponentialBackoff::default();
-    let retry_policy = AlwaysRetry.with_attempt_limit(3);
-    let svc = PredictionService::builder()
-        .with_credentials(credentials)
-        .with_endpoint(endpoint)
-        .with_backoff_policy(exponential_backoff)
-        .with_retry_policy(retry_policy)
-        .build()
-        .await?;
     let res = svc
         .generate_content()
         .with_request(r.req)
